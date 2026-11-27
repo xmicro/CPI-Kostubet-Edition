@@ -145,6 +145,8 @@ internal object LockscreenGlass {
     private var loader:ClassLoader?=null
     private var keyguard:KeyguardManager?=null
     private var interactive=false
+    private var hasStatusBarStateHook=false
+    private var hasKeyguardStateHook=false
     private var keyguardState:Int?=null
     private var keyguardShowing:Boolean?=null
     private var keyguardOccluded=false
@@ -252,6 +254,7 @@ internal object LockscreenGlass {
         rowId=id("expandableNotificationRow")
         pinClass=XposedHelpers.findClassIfExists("com.android.keyguard.NumPadKey",loader)
         pinRootClass=XposedHelpers.findClassIfExists(PIN_ROOT,loader)
+        var hasDozingHook=false
         XposedHelpers.findClassIfExists(STATUS,loader)?.let {type->
             val state=object:XC_MethodHook(){
                 override fun afterHookedMethod(p:MethodHookParam){
@@ -261,11 +264,11 @@ internal object LockscreenGlass {
                     onMain {keyguardState=next;dozing=asleep;refreshVisibility()}
                 }
             }
-            XposedBridge.hookAllMethods(type,"setState",state)
-            XposedBridge.hookAllMethods(type,"setIsDozing",state)
+            hasStatusBarStateHook=XposedBridge.hookAllMethods(type,"setState",state).isNotEmpty()
+            hasDozingHook=XposedBridge.hookAllMethods(type,"setIsDozing",state).isNotEmpty()
         }
         XposedHelpers.findClassIfExists(KEYGUARD_STATE,loader)?.let {type->
-            XposedBridge.hookAllMethods(type,"notifyKeyguardState",object:XC_MethodHook(){
+            hasKeyguardStateHook=XposedBridge.hookAllMethods(type,"notifyKeyguardState",object:XC_MethodHook(){
                 override fun afterHookedMethod(p:MethodHookParam){
                     if(p.hasThrowable() || p.args.size!=2)return
                     val showing=p.args[0] as? Boolean ?: return
@@ -276,8 +279,9 @@ internal object LockscreenGlass {
                         refreshVisibility()
                     }
                 }
-            })
+            }).isNotEmpty()
         }
+        GlassLogger.i("LockscreenGlass","Visibility hooks: state=$hasStatusBarStateHook, dozing=$hasDozingHook, keyguard=$hasKeyguardStateHook")
         XposedHelpers.findClassIfExists(WALLPAPER,loader)?.let {type->
             XposedBridge.hookAllConstructors(type,object:XC_MethodHook(){
                 override fun afterHookedMethod(p:MethodHookParam){
@@ -322,9 +326,18 @@ internal object LockscreenGlass {
         ContextCompat.registerReceiver(context,object:BroadcastReceiver(){
             override fun onReceive(c:Context?,intent:Intent?){
                 when(intent?.action){
-                    Intent.ACTION_SCREEN_OFF->interactive=false
-                    Intent.ACTION_SCREEN_ON->interactive=true
-                    Intent.ACTION_USER_PRESENT->{keyguardState=0;keyguardShowing=false}
+                    Intent.ACTION_SCREEN_OFF->{
+                        interactive=false
+                        if(!hasKeyguardStateHook)keyguardShowing=null
+                    }
+                    Intent.ACTION_SCREEN_ON->{
+                        interactive=true
+                        if(!hasKeyguardStateHook)keyguardShowing=null
+                    }
+                    Intent.ACTION_USER_PRESENT->{
+                        keyguardState=if(hasStatusBarStateHook)0 else null
+                        keyguardShowing=if(hasKeyguardStateHook && keyguardShowing!=null)false else null
+                    }
                     Intent.ACTION_USER_UNLOCKED->{
                         if(visible && LockscreenBackdrop.frame?.images.isNullOrEmpty()){
                             main.removeCallbacks(retryWallpaper)
@@ -435,8 +448,14 @@ internal object LockscreenGlass {
 
     private fun onMain(action:()->Unit){if(Looper.myLooper()===Looper.getMainLooper())action()else main.post(action)}
 
+    private fun isLockscreenLocked():Boolean {
+        // Without native keyguard callbacks, never cache an unlocked state across relocks.
+        if(!hasKeyguardStateHook)return keyguard?.isKeyguardLocked==true
+        return keyguardShowing ?: ((hasStatusBarStateHook && keyguardState==KEYGUARD) || keyguard?.isKeyguardLocked==true)
+    }
+
     private fun refreshVisibility(){
-        val locked=keyguardShowing ?: (keyguardState==KEYGUARD || keyguard?.isKeyguardLocked==true)
+        val locked=isLockscreenLocked()
         val show=(profiles.isNotEmpty() || softActivities) && interactive && !dozing && locked
         if(show==visible){
             if((!interactive || dozing || keyguardOccluded || Surface.CLOCK !in profiles) &&
@@ -554,8 +573,7 @@ internal object LockscreenGlass {
         if(!visible){
             // Keep a bounded static backdrop ready for the next wake.
             // Live wallpaper capture and blur jobs stop in AOD.
-            val sleeping=(!interactive || dozing) && !keyguardOccluded &&
-                (keyguardShowing ?: (keyguard?.isKeyguardLocked==true))
+            val sleeping=(!interactive || dozing) && !keyguardOccluded && isLockscreenLocked()
             val clockRadius=profiles[Surface.CLOCK]?.sourceRadius(Surface.CLOCK)
             if(!LockscreenBackdrop.stop(keepStatic=sleeping,clockRadius=clockRadius)){
                 views.values.forEach {it.discard()}
