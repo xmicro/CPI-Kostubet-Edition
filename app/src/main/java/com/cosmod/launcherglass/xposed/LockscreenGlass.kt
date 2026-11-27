@@ -186,7 +186,10 @@ internal object LockscreenGlass {
     private var notificationId=View.NO_ID
     private var capsuleTitleId=View.NO_ID
     private var clockHostId=View.NO_ID
-    private var wallpaperRetry=false
+    private var wallpaperRetries=0
+    private val retryWallpaper=Runnable {
+        if(visible && LockscreenBackdrop.frame?.images.isNullOrEmpty())prepareWallpaper(refresh=true)
+    }
     private var wallpaperSource="waiting"
     private var unlockSpeed=100
     private var unlockSmoothness=0
@@ -313,6 +316,7 @@ internal object LockscreenGlass {
         val filter=IntentFilter(Intent.ACTION_SCREEN_ON).apply {
             addAction(Intent.ACTION_SCREEN_OFF)
             addAction(Intent.ACTION_USER_PRESENT)
+            addAction(Intent.ACTION_USER_UNLOCKED)
             addAction(Intent.ACTION_WALLPAPER_CHANGED)
         }
         ContextCompat.registerReceiver(context,object:BroadcastReceiver(){
@@ -321,6 +325,14 @@ internal object LockscreenGlass {
                     Intent.ACTION_SCREEN_OFF->interactive=false
                     Intent.ACTION_SCREEN_ON->interactive=true
                     Intent.ACTION_USER_PRESENT->{keyguardState=0;keyguardShowing=false}
+                    Intent.ACTION_USER_UNLOCKED->{
+                        if(visible && LockscreenBackdrop.frame?.images.isNullOrEmpty()){
+                            main.removeCallbacks(retryWallpaper)
+                            wallpaperRetries=0
+                            prepareWallpaper(refresh=true)
+                        }
+                        return
+                    }
                     Intent.ACTION_WALLPAPER_CHANGED->{
                         if(visible)prepareWallpaper(refresh=true)
                         else if(clockAnimator==null)LockscreenBackdrop.stop()
@@ -365,6 +377,7 @@ internal object LockscreenGlass {
             if(contourChanged)refreshClockMaterial()
             return
         }
+        val notificationsEnabled=Surface.NOTIFICATIONS in next && Surface.NOTIFICATIONS !in profiles
         profiles=next
         if(Surface.NOTIFICATIONS !in profiles)clearNotificationMovement()
         if(next[Surface.NOTIFICATIONS]?.corner?.let {it>=0}!=true)restoreNotificationCorners()
@@ -414,6 +427,10 @@ internal object LockscreenGlass {
         refreshVisibility()
         if(visible)prepareWallpaper()
         repaint()
+        // Settings may arrive after SystemUI has already recorded notification draw lists.
+        if(notificationsEnabled && Surface.NOTIFICATIONS in profiles)main.post {
+            if(Surface.NOTIFICATIONS in profiles)discoverExistingNotifications()
+        }
     }
 
     private fun onMain(action:()->Unit){if(Looper.myLooper()===Looper.getMainLooper())action()else main.post(action)}
@@ -430,7 +447,8 @@ internal object LockscreenGlass {
             return
         }
         visible=show
-        wallpaperRetry=false
+        main.removeCallbacks(retryWallpaper)
+        wallpaperRetries=0
         if(show){
             prepareWallpaper()
             showClockWhenReady()
@@ -556,9 +574,12 @@ internal object LockscreenGlass {
         val frame=LockscreenBackdrop.frame
         wallpaperSource=frame?.source ?: "unavailable"
         GlassLogger.limited("LockscreenGlass","wallpaper-"+wallpaperSource) {"Wallpaper source: "+wallpaperSource}
-        if(visible && frame?.images.isNullOrEmpty() && !wallpaperRetry){
-            wallpaperRetry=true
-            main.postDelayed({if(visible && LockscreenBackdrop.frame?.images.isNullOrEmpty())prepareWallpaper(refresh=true)},750L)
+        if(!frame?.images.isNullOrEmpty()){
+            main.removeCallbacks(retryWallpaper)
+            wallpaperRetries=0
+        }else if(visible && wallpaperRetries<(if(frame?.live==true)1 else 3) && !main.hasCallbacks(retryWallpaper)){
+            wallpaperRetries++
+            main.postDelayed(retryWallpaper,750L)
         }
         showClockWhenReady()
         showSurfacesWhenReady()
@@ -975,20 +996,53 @@ internal object LockscreenGlass {
         notificationCorners[view]=NotificationCorners(stockTop,stockBottom,top,bottom)
     }
 
-    private fun beginNotification(p:XC_MethodHook.MethodHookParam){
-        if(!visible || surfaceAmount<=0f)return
-        val profile=profiles[Surface.NOTIFICATIONS] ?: return
-        val view=p.thisObject as View
-        if(notificationId!=View.NO_ID && view.id!=notificationId)return
-        val row=view.parent as? View ?: return
+    private fun notificationRow(view:View):View? {
+        if(notificationId!=View.NO_ID && view.id!=notificationId)return null
+        val row=view.parent as? View ?: return null
         if((rowId==View.NO_ID || row.id!=rowId) &&
-            generateSequence(row.javaClass as Class<*>?) {it.superclass}.none {it.name==NOTIFICATION_ROW})return
+            generateSequence(row.javaClass as Class<*>?) {it.superclass}.none {it.name==NOTIFICATION_ROW})return null
+        return row
+    }
+
+    // One bounded scan at feature activation; no per-frame hierarchy traversal.
+    private fun discoverExistingNotifications(){
+        val loader=loader ?: return
+        val type=XposedHelpers.findClassIfExists(NOTIFICATION,loader) ?: return
+        try {
+            val global=XposedHelpers.callStaticMethod(Class.forName("android.view.WindowManagerGlobal"),"getInstance")
+            val names=XposedHelpers.callMethod(global,"getViewRootNames") as? Array<*> ?: return
+            for(name in names){
+                val root=XposedHelpers.callMethod(global,"getRootView",name) as? View ?: continue
+                if(root.display?.displayId!=Display.DEFAULT_DISPLAY)continue
+                val pending=java.util.ArrayDeque<View>()
+                pending.add(root)
+                var remaining=4096
+                while(pending.isNotEmpty() && remaining-->0){
+                    val view=pending.removeLast()
+                    if(type.isInstance(view) && notificationRow(view)!=null){
+                        target(view,Surface.NOTIFICATIONS)
+                        if(view.isAttachedToWindow)view.invalidate()
+                    }
+                    if(view is ViewGroup)for(i in 0 until view.childCount)pending.add(view.getChildAt(i))
+                }
+            }
+        }catch(t:Throwable){GlassLogger.limited("LockscreenGlass","notification-discovery") {"Existing notifications unavailable: "+t.javaClass.simpleName}}
+    }
+
+    private fun beginNotification(p:XC_MethodHook.MethodHookParam){
+        val profile=profiles[Surface.NOTIFICATIONS] ?: return
+        if(Looper.myLooper()!==Looper.getMainLooper())return
+        val view=p.thisObject as View
+        val row=notificationRow(view) ?: return
+        // Register legitimate backgrounds even before the glass can draw.
+        // Existing repaint and entrance animation invalidation now reach them.
+        if(view.isAttachedToWindow && view.display?.displayId==Display.DEFAULT_DISPLAY)target(view,Surface.NOTIFICATIONS)
+        if(!visible || surfaceAmount<=0f)return
         val canvas=p.args[0] as Canvas
         if(!renderable(view,canvas))return
         try {
             if(NativeIconAccess.call(row,"isHeadsUp")==true ||
                 NativeIconAccess.field(view,"mExpandAnimationRunning")==true)return
-            target(view,Surface.NOTIFICATIONS)
             if(LockscreenBackdrop.frame?.images?.containsKey(profile.sourceRadius(Surface.NOTIFICATIONS))!=true)return
             val actual=NativeIconAccess.call(view,"getActualHeight") as? Int ?: view.height
             if(actual<=0)return
