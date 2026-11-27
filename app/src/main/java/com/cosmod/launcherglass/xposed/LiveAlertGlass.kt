@@ -311,7 +311,12 @@ internal object LiveAlertGlass {
                     val store=c.createDeviceProtectedStorageContext().getSharedPreferences("cherrypick_alert_guard_v2",Context.MODE_PRIVATE)
                     guard=store
                     val reload = HostSettingsReload(main, read = {
-                        c.contentResolver.call(SettingsProvider.CONTENT_URI,SettingsProvider.METHOD_GET_ALL,null,null)
+                        val snapshot=c.contentResolver.call(SettingsProvider.CONTENT_URI,SettingsProvider.METHOD_GET_ALL,null,null)
+                        GlassLogger.limited("LiveAlertGlass","systemui-settings-snapshot"){
+                            if(snapshot==null)"SystemUI settings unavailable"
+                            else "SystemUI settings loaded: enabled="+snapshot.getBoolean(SettingsProvider.KEY_ENABLED,false)
+                        }
+                        snapshot
                     }, apply = { snapshot ->
                         try { load(snapshot) } catch (t: Throwable) { disable(t) }
                     })
@@ -336,6 +341,28 @@ internal object LiveAlertGlass {
                     androidx.core.content.ContextCompat.registerReceiver(c,restart,filter,SystemUiControl.PERMISSION,main,
                         androidx.core.content.ContextCompat.RECEIVER_EXPORTED)
                     c.contentResolver.registerContentObserver(SettingsProvider.CONTENT_URI, true, reload)
+                    // The settings provider may be unavailable before the first unlock.
+                    // USER_PRESENT also covers a userspace restart with storage already unlocked.
+                    val userManager=c.getSystemService(UserManager::class.java)
+                    val unlock=object:android.content.BroadcastReceiver(){
+                        override fun onReceive(context:Context?,intent:android.content.Intent?){
+                            val action=intent?.action
+                            if(action!=android.content.Intent.ACTION_USER_UNLOCKED &&
+                                action!=android.content.Intent.ACTION_USER_PRESENT)return
+                            if(userManager?.isUserUnlocked!=true)return
+                            c.unregisterReceiver(this)
+                            GlassLogger.i("LiveAlertGlass","First unlock: refreshing SystemUI settings")
+                            reload.onChange(false)
+                        }
+                    }
+                    val unlockFilter=android.content.IntentFilter(android.content.Intent.ACTION_USER_UNLOCKED).apply {
+                        addAction(android.content.Intent.ACTION_USER_PRESENT)
+                    }
+                    try {
+                        androidx.core.content.ContextCompat.registerReceiver(c,unlock,unlockFilter,null,main,
+                            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED)
+                    }catch(t:Throwable){GlassLogger.e("LiveAlertGlass","First-unlock receiver unavailable",t)}
+                    GlassLogger.i("LiveAlertGlass","Initial settings read: userUnlocked="+userManager?.isUserUnlocked)
                     reload.reloadImmediately()
                 }catch(t:Throwable){disable(t)}
             }
